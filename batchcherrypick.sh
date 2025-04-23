@@ -13,33 +13,36 @@ function show_help {
   echo
   echo "Options:"
   echo "  -h          Show this help message"
-  echo "  -c FILE     Specify CSV output file (default: \$BATCH_CHERRY_PICK_OUTPUT/cherrypick_progress.csv or ~/cherrypick_progress.csv)"
-  echo "  -f          Continue from last successful commit in existing CSV file"
+  echo "  -c FILE     Specify Markdown output file (default: \$BATCH_CHERRY_PICK_OUTPUT/cherrypick_progress.md or ~/cherrypick_progress.md)"
+  echo "  -f          Continue from last successful commit in existing Markdown file"
   echo "  -s HASH     Specify starting commit hash"
   echo "  -e HASH     Specify ending commit hash"
+  echo "  -a          Auto-continue cherry-picking until a conflict arises. Automatically checks if conflicts are resolved and continues without user input."
   exit 0
 }
 
-# Function to generate CSV filename from hashes
-function generate_csv_filename {
+# Function to generate Markdown filename from hashes
+function generate_md_filename {
   local start=$1
   local end=$2
-  echo "${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_${start:0:7}_${end:0:7}.csv"
+  echo "${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_${start:0:7}_${end:0:7}.md"
 }
 
-# Set default CSV file or use environment variable or command line argument
-csv_file="${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_progress.csv"
+# Set default Markdown file or use environment variable or command line argument
+md_file="${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_progress.md"
 continue_previous=false
+auto_continue=false
 
 # Parse command line arguments
-while getopts "hc:f:s:e:" opt; do
+while getopts "hc:f:s:e:a" opt; do
   case $opt in
     h) show_help ;;
-    c) csv_file="$OPTARG" ;;
+    c) md_file="$OPTARG" ;;
     f) continue_previous=true ;;
     s) start_hash="$OPTARG" ;;
     e) end_hash="$OPTARG" ;;
-    \?) echo "Usage: $0 [-h] [-c csv_file] [-f to continue] [-s start_hash] [-e end_hash]" >&2; exit 1 ;;
+    a) auto_continue=true ;;
+    \?) echo "Usage: $0 [-h] [-c markdown_file] [-f to continue] [-s start_hash] [-e end_hash] [-a for auto-continue]" >&2; exit 1 ;;
   esac
 done
 
@@ -62,24 +65,25 @@ if ! git cat-file -e "$end_hash"^{commit} 2>/dev/null; then
   error_exit "Error: Ending hash $end_hash is not a valid commit."
 fi
 
-# Generate CSV filename if not specified via -c option
-if [ "$csv_file" = "${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_progress.csv" ]; then
-  csv_file=$(generate_csv_filename "$start_hash" "$end_hash")
+# Generate Markdown filename if not specified via -c option
+if [ "$md_file" = "${BATCH_CHERRY_PICK_OUTPUT:-$HOME}/cherrypick_progress.md" ]; then
+  md_file=$(generate_md_filename "$start_hash" "$end_hash")
 fi
 
 # Check if file exists and continue from last successful commit
-if [ -f "$csv_file" ]; then
+if [ -f "$md_file" ]; then
   echo ""
-  echo "Found existing progress file: $csv_file"
-  last_processed=$(awk -F, '$2!="pending" && $1!="commit_hash" {last=$1} END {print last}' "$csv_file")
+  echo "Found existing progress file: $md_file"
+  last_processed=$(awk -F'|' '$2!="pending" && $1!="commit_hash" {last=$1} END {print last}' "$md_file")
   if [ -n "$last_processed" ]; then
     echo "Continuing from last processed commit: $last_processed"
     start_hash=$last_processed
   fi
   continue_previous=true
 else
-  echo "Creating new progress file: $csv_file"
-  echo "commit_hash,status,timestamp,commit_message" > "$csv_file"
+  echo "Creating new progress file: $md_file"
+  # Initialize the commit data array
+  declare -a commit_data
 fi
 
 # Get the list of commits between the two hashes
@@ -90,15 +94,6 @@ if [ -z "$commits" ]; then
   error_exit "No commits found between $start_hash and $end_hash."
 fi
 
-# Write all commits to CSV with 'pending' status if not continuing from previous
-if [ "$continue_previous" = false ]; then
-  for commit in $commits; do
-    commit_msg=$(git log --format=%s -n 1 "$commit" | sed 's/,/;/g')
-    echo "$commit,pending,$(date '+%Y-%m-%d %H:%M:%S'),$commit_msg" >> "$csv_file"
-  done
-  echo "Written all commits to $csv_file with pending status."
-fi
-
 # Loop through the commits and cherry-pick each one
 for commit in $commits; do
   echo ""
@@ -107,14 +102,35 @@ for commit in $commits; do
   echo "Commit message:"
   echo "$commit_msg"
   echo ""
-  read -p "Do you want to cherry-pick this commit? (y/n/q, default: y): " choice
-  choice=${choice:-y}
+
+  if [ "$auto_continue" = true ]; then
+    # Auto-continue without prompting the user
+    choice="y"
+    echo "Auto-continue is enabled. Automatically choosing 'y' to cherry-pick this commit."
+  else
+    # If auto-continue is not set, ask the user for input
+    read -p "Do you want to cherry-pick this commit? (y/n/q, default: y): " choice
+    choice=${choice:-y}
+  fi
+
+  echo "Choice: $choice"  # Debugging output to verify the choice
 
   case $choice in
     y|Y)
       if ! git cherry-pick "$commit"; then
-        echo "Error while cherry-picking commit $commit. Please resolve the conflict and press Enter to continue."
-        read -p "Press Enter to continue to the next commit..."
+        echo "Conflict detected while cherry-picking commit $commit."
+        if [ "$auto_continue" = true ]; then
+          echo "Waiting for conflict resolution..."
+          # Wait until conflict is resolved
+          while git status | grep -q 'both modified'; do
+            sleep 2  # Wait a little before checking again
+          done
+          echo "Conflict resolved. Continuing cherry-pick..."
+          git cherry-pick --continue
+        else
+          echo "Please resolve the conflict manually, then press Enter to continue."
+          read -p "Press Enter to continue to the next commit..."
+        fi
         status="conflict-resolved"
       else
         status="success"
@@ -134,26 +150,22 @@ for commit in $commits; do
       ;;
   esac
 
-  # Record progress in CSV
-  # Create temporary file
-  temp_file=$(mktemp)
-  commit_msg=$(git log --format=%s -n 1 "$commit" | sed 's/,/;/g')
-  # Update existing row or add new one
-  if grep -q "^$commit," "$csv_file"; then
-    # Update the existing row
-    awk -F, -v commit="$commit" -v status="$status" -v timestamp="$(date '+%Y-%m-%d %H:%M:%S')" -v msg="$commit_msg" \
-      'BEGIN {OFS=","} $1==commit {$2=status; $3=timestamp; $4=msg} {print}' "$csv_file" > "$temp_file"
-  else
-    # Copy existing content and append new row
-    cat "$csv_file" > "$temp_file"
-    echo "$commit,$status,$(date '+%Y-%m-%d %H:%M:%S'),$commit_msg" >> "$temp_file"
-  fi
-  mv "$temp_file" "$csv_file"
-  echo "Processed commit $commit with status: $status"
+  # Convert the commit hash to a Markdown link
+  commit_link="[${commit}](https://github.com/prebid/Prebid.js/commit/${commit})"
 
-  if [ "$status" != "skipped" ]; then
-    read -p "Press Enter to continue to the next commit..."
-  fi
+  # Transform any PR number (e.g., #12379) in the commit message into a Markdown link.
+  # This uses sed with a regular expression that matches '#' followed by one or more digits.
+  pr_linked_message=$(echo "$commit_msg" | sed -E 's/#([0-9]+)/[#\1](https:\/\/github.com\/prebid\/Prebid.js\/pull\/\1)/g')
+
+  # Store commit information in the array
+  commit_data+=("$commit_link|$status|$(date '+%Y-%m-%d %H:%M:%S')|$pr_linked_message")
 done
 
-echo "All commits between $start_hash and $end_hash have been cherry-picked successfully."
+# Now that all commits are processed, generate the Markdown file
+echo -e "| Commit Hash | Status | Timestamp | Commit Message |" > "$md_file"
+echo -e "|-------------|--------|-----------|----------------|" >> "$md_file"
+for entry in "${commit_data[@]}"; do
+  echo "$entry" >> "$md_file"
+done
+
+echo "All commits between $start_hash and $end_hash have been cherry-picked successfully, and progress has been recorded in $md_file."
